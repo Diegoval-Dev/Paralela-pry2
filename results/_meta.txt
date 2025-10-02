@@ -1,5 +1,5 @@
 # Bench metadata
-timestamp=2025-10-01T19:57:13-06:00
+timestamp=2025-10-01T20:45:44-06:00
 host=DiegoVal
 kernel=Linux 6.6.87.2-microsoft-standard-WSL2
 distro=Ubuntu 22.04.5 LTS
@@ -8,7 +8,7 @@ cpu_cores=12
 mpirun=mpirun (Open MPI) 4.1.2
 openssl=OpenSSL 3.0.2 15 Mar 2022 (Library: OpenSSL 3.0.2 15 Mar 2022)
 cpu_governor=
-git_commit=460f983
+git_commit=c3c09ff
 np_list=1 2 4 8
 runs=5
 limit=268435456

@@ -161,19 +161,8 @@ for NP in $NP_LIST; do
   echo "[RUN] np=${NP}  runs=${RUNS}  limit=${LIMIT}"
   for r in $(seq 1 "$RUNS"); do
     TS=$(date -Is)
-
-    # Guardamos TODO el output y luego extraemos la línea útil desde el archivo
-    LOG="${OUTDIR}/.last_run_np_${NP}_r${r}.log"
-    mpirun ${MPIRUN_FLAGS} -np "${NP}" "${BINARY}" "${LIMIT}" 2>&1 | tee "$LOG" >/dev/null
-
-    # Tomamos la ÚLTIMA línea que comience con "np=...; key="
-    LINE=$(awk '/^np=[0-9]+; key=/{last=$0} END{if(last!="") print last}' "$LOG")
-
-    # Si no hay match, no escribimos al CSV (evita NA)
-    if [[ -z "$LINE" ]]; then
-      echo "WARN: no se encontró línea con 'np=...; key=' (ver $LOG)" >&2
-      continue
-    fi
+    # Ejecuta y captura una sola línea de salida
+    LINE=$(mpirun ${MPIRUN_FLAGS} -np "${NP}" "${BINARY}" "${LIMIT}" 2>&1 | grep -E "np=[0-9]+; key=" | tail -n1)
 
     # Parseo robusto (key, winner, t_total)
     KEY=$(sed -n 's/.*key=\([^;]*\).*/\1/p' <<< "$LINE")
