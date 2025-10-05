@@ -1,24 +1,24 @@
+// bruteforce.c — Persona 1 listo: CLI, block|interleaved, winner correcto, salida estable
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
 #include <limits.h>
+#include <getopt.h>
 #include <mpi.h>
 #include <openssl/des.h>
 
-#ifndef SELFTEST
-#define SELFTEST 0   // pon 1 para autogenerar cipher con key chica y validar end-to-end
+#ifndef GIT_COMMIT
+#define GIT_COMMIT "nogit"
 #endif
 
-// --- Utilidades DES con OpenSSL ---
-
+// --- Conversión 56->64 con paridad impar ---
 static inline void key56_to_block(uint64_t key56, DES_cblock *out){
-    // Empaqueta 56 bits en 8 bytes dejando 1 bit de paridad por byte
     uint64_t k = 0;
     for(int i=0;i<8;i++){
-        key56 <<= 1;                            // deja LSB libre para paridad
-        k |= (key56 & (0xFEull << (i*8)));      // 7 bits útiles por byte
+        key56 <<= 1;
+        k |= (key56 & (0xFEull << (i*8)));
     }
     memcpy(out, &k, 8);
     DES_set_odd_parity(out);
@@ -33,157 +33,186 @@ static inline void des_decrypt(uint64_t key, unsigned char *buf, int len){
     }
 }
 
-static inline void des_encrypt(uint64_t key, unsigned char *buf, int len){
-    DES_cblock cb; DES_key_schedule ks;
-    key56_to_block(key, &cb);
-    DES_set_key_unchecked(&cb, &ks);
-    for(int i=0;i<len; i+=8){
-        DES_ecb_encrypt((const_DES_cblock*)(buf+i), (DES_cblock*)(buf+i), &ks, DES_ENCRYPT);
-    }
-}
-
-// --- Búsqueda patrón ---
-static const char SEARCH[] = " the ";
-
-static int tryKey(uint64_t key, const unsigned char *ciph, int len){
-    // len debe ser múltiplo de 8
+static inline int tryKey(uint64_t key, const unsigned char *ciph, int len, const char *pattern){
     unsigned char *tmp = (unsigned char*)malloc((size_t)len + 1);
     if(!tmp) return 0;
     memcpy(tmp, ciph, (size_t)len);
-    tmp[len] = 0; // por si el texto es ASCII
+    tmp[len] = 0; 
     des_decrypt(key, tmp, len);
-    int ok = (strstr((const char*)tmp, SEARCH) != NULL);
+    int ok = (strstr((const char*)tmp, pattern) != NULL);
     free(tmp);
     return ok;
 }
 
-// --- Cipher embebido (tu arreglo), sin byte 0 al final ---
+// --- Cipher embebido de respaldo (16B) ---
 static unsigned char cipher_embedded[] = {
     108,245,65,63,125,200,150,66,17,170,207,170,34,31,70,215
 };
-// Si mantienes el 0 final, usa sizeof()-1; aquí lo quitamos:
-static const int CIPH_LEN = (int)sizeof(cipher_embedded);
+static const int CIPH_LEN_EMB = (int)sizeof(cipher_embedded);
 
-// Para SELFTEST: genera un cipher coherente con una llave chica y el patrón " the "
-static void init_selftest_cipher(uint64_t key, unsigned char *dst, int len){
-    // Llena dst con un texto conocido (múltiplo de 8) que contenga " the "
-    // y lo cifra con 'key'. Para len=16 caben 16 chars.
-    const char *plain16 = " in the room..."; // 16 bytes si recortas/ajustas
-    unsigned char buf[16];
-    memset(buf, 0, 16);
-    memcpy(buf, plain16, 16);
-    memcpy(dst, buf, 16);
-    des_encrypt(key, dst, 16);
+// --- Utilidades I/O ---
+static unsigned char* read_all(const char *path, int *out_len){
+    FILE *f = fopen(path, "rb");
+    if(!f) return NULL;
+    fseek(f,0,SEEK_END); long L = ftell(f); fseek(f,0,SEEK_SET);
+    if(L<=0){ fclose(f); return NULL; }
+    unsigned char *buf = (unsigned char*)malloc((size_t)L);
+    if(!buf){ fclose(f); return NULL; }
+    if(fread(buf,1,(size_t)L,f)!=(size_t)L){ fclose(f); free(buf); return NULL; }
+    fclose(f);
+    *out_len = (int)L;
+    return buf;
 }
 
-// --- Main ---
+// --- CLI ---
+typedef enum { DIST_BLOCK=0, DIST_INTERLEAVED=1 } dist_t;
+
+static void usage(const char *prog){
+    fprintf(stderr,
+    "Uso: %s [opciones]\n"
+    "  -i <cipher.bin>    archivo binario (longitud múltiplo de 8). Si no se da, usa embebido.\n"
+    "  -p <pattern>       patrón a buscar (default: \" the \")\n"
+    "  --limit <ULL>      límite superior de claves (default: 2^56)\n"
+    "  --dist <mode>      {block,interleaved} (default: block)\n"
+    "  --check <N>        intervalo de MPI_Test (default: 2^18)\n", prog);
+}
 
 int main(int argc, char **argv){
-    MPI_Init(&argc, &argv);
+    // ---- defaults ----
+    const char *in_path = NULL;
+    const char *pattern = " the ";
+    uint64_t upper = (1ULL<<56);
+    dist_t dist = DIST_BLOCK;
+    uint64_t check_interval = (1ULL<<18);
 
+    // ---- getopt_long ----
+    static struct option longopts[] = {
+        {"limit", required_argument, 0, 1},
+        {"dist",  required_argument, 0, 2},
+        {"check", required_argument, 0, 3},
+        {0,0,0,0}
+    };
+    int opt, idx=0;
+    while((opt=getopt_long(argc, argv, "i:p:", longopts, &idx))!=-1){
+        if(opt=='i') in_path = optarg;
+        else if(opt=='p') pattern = optarg;
+        else if(opt==1){ upper = strtoull(optarg, NULL, 0); }
+        else if(opt==2){
+            if(strcmp(optarg,"block")==0) dist=DIST_BLOCK;
+            else if(strcmp(optarg,"interleaved")==0) dist=DIST_INTERLEAVED;
+            else { fprintf(stderr,"--dist debe ser block|interleaved\n"); return 1; }
+        } else if(opt==3){ check_interval = strtoull(optarg,NULL,0); }
+        else { usage(argv[0]); return 1; }
+    }
+
+    // ---- MPI init ----
+    MPI_Init(&argc, &argv);
     MPI_Comm comm = MPI_COMM_WORLD;
     int N=0, id=0;
     MPI_Comm_size(comm, &N);
     MPI_Comm_rank(comm, &id);
 
-    // Límite superior de claves: por defecto enorme; para pruebas pasa un menor en argv[1]
-    uint64_t upper = (argc > 1) ? strtoull(argv[1], NULL, 0) : (1ULL << 56);
-
-    // Buffer de ciphertext de trabajo (por defecto el embebido)
-    unsigned char *cipher = cipher_embedded;
-    int ciphlen = CIPH_LEN; // ¡no uses strlen() en binarios!
-
-#if SELFTEST
-    // Para validar end-to-end rápido: llave peque (p.ej. 0x123456)
-    static unsigned char self_cipher[16];
-    uint64_t self_key = 0x123456ULL;
-    init_selftest_cipher(self_key, self_cipher, 16);
-    cipher = self_cipher;
-    ciphlen = 16;
-    if(id==0){
-        fprintf(stderr, "[SELFTEST] Generé cipher con key=%llu (hex=%llx)\n",
-                (unsigned long long)self_key, (unsigned long long)self_key);
-    }
-#endif
-
-    if((ciphlen % 8) != 0){
-        if(id==0) fprintf(stderr, "Error: ciphlen=%d no es múltiplo de 8.\n", ciphlen);
-        MPI_Abort(comm, 2);
+    // ---- cargar cipher ----
+    unsigned char *cipher = NULL;
+    int ciphlen = 0;
+    if(in_path){
+        cipher = read_all(in_path, &ciphlen);
+        if(!cipher){
+            if(id==0) fprintf(stderr,"Error: no pude leer %s\n", in_path);
+            MPI_Abort(comm, 2);
+        }
+        if((ciphlen % 8)!=0){
+            if(id==0) fprintf(stderr,"Error: %s no es múltiplo de 8 (len=%d)\n", in_path, ciphlen);
+            free(cipher);
+            MPI_Abort(comm, 2);
+        }
+    } else {
+        cipher = cipher_embedded;
+        ciphlen = CIPH_LEN_EMB;
     }
 
-    // Partición por rangos contiguos
-    uint64_t range_per_node = upper / (uint64_t)N;
-    uint64_t mylower = range_per_node * (uint64_t)id;
-    uint64_t myupper = (id == N-1) ? upper : (range_per_node * (uint64_t)(id+1) - 1ULL);
-
+    // ---- búsqueda ----
     const unsigned long long NOT_FOUND = ULLONG_MAX;
     unsigned long long found = NOT_FOUND;
+
     MPI_Request req;
     MPI_Status st;
-    int flag = 0;
-
-    // Recv no bloqueante para parada temprana
-    MPI_Irecv(&found, 1, MPI_UNSIGNED_LONG_LONG, MPI_ANY_SOURCE, 0, comm, &req);
+    unsigned long long recv_buf = NOT_FOUND;
+    MPI_Irecv(&recv_buf, 1, MPI_UNSIGNED_LONG_LONG, MPI_ANY_SOURCE, 0, comm, &req);
 
     double t0 = MPI_Wtime();
 
-    // Búsqueda
-    const uint64_t CHECK_INTERVAL = 1ULL << 18; // revisa mensajes cada ~262k intentos
-    uint64_t counter = 0;
+    int local_found_flag = 0;
+    uint64_t tries = 0;
 
-    for(uint64_t k = mylower; k <= myupper && found == NOT_FOUND; ++k){
-        if(tryKey(k, cipher, ciphlen)){
-            found = k;
-            // Avisar a todos para detener
-            for(int node=0; node<N; ++node){
-                if(node == id) continue; // opcional
-                MPI_Send(&found, 1, MPI_UNSIGNED_LONG_LONG, node, 0, comm);
+    if(dist == DIST_BLOCK){
+        uint64_t range_per_node = upper / (uint64_t)N;
+        uint64_t mylower = range_per_node * (uint64_t)id;
+        uint64_t myupper = (id == N-1) ? upper : (range_per_node * (uint64_t)(id+1) - 1ULL);
+        for(uint64_t k = mylower; k <= myupper && found==NOT_FOUND; ++k){
+            if(tryKey(k, cipher, ciphlen, pattern)){
+                found = k; local_found_flag = 1;
+                for(int node=0; node<N; ++node){ if(node!=id)
+                    MPI_Send(&found, 1, MPI_UNSIGNED_LONG_LONG, node, 0, comm);
+                }
+                break;
             }
-            break;
+            if((++tries % check_interval)==0){
+                int flag=0; MPI_Test(&req,&flag,&st);
+                if(flag){ found = recv_buf; break; }
+            }
         }
-        if((++counter & (CHECK_INTERVAL-1)) == 0){
-            MPI_Test(&req, &flag, &st);
-            if(flag) break; // alguien ya publicó la llave
+    } else {
+        for(uint64_t k = (uint64_t)id; k < upper && found==NOT_FOUND; k += (uint64_t)N){
+            if(tryKey(k, cipher, ciphlen, pattern)){
+                found = k; local_found_flag = 1;
+                for(int node=0; node<N; ++node){ if(node!=id)
+                    MPI_Send(&found, 1, MPI_UNSIGNED_LONG_LONG, node, 0, comm);
+                }
+                break;
+            }
+            if((++tries % check_interval)==0){
+                int flag=0; MPI_Test(&req,&flag,&st);
+                if(flag){ found = recv_buf; break; }
+            }
         }
     }
 
-    // Si rank 0 no encontró ni recibió aún, espera por si alguien avisó
-    if(id==0 && found==NOT_FOUND){
-        MPI_Test(&req, &flag, &st);
-        if(!flag) MPI_Wait(&req, &st);
+    // recoger posible aviso pendiente
+    if(found==NOT_FOUND){
+        int flag=0; MPI_Test(&req,&flag,&st);
+        if(flag) found = recv_buf;
     }
+
+    // sincroniza el resultado global (y ganador consistente)
+    unsigned long long my_found_val = (found!=NOT_FOUND)?found:ULLONG_MAX;
+    unsigned long long global_found = ULLONG_MAX;
+    MPI_Allreduce(&my_found_val, &global_found, 1, MPI_UNSIGNED_LONG_LONG, MPI_MIN, comm);
+
+    int local_win_id1 = local_found_flag ? (id+1) : 0;
+    int win_id1 = 0;
+    MPI_Allreduce(&local_win_id1, &win_id1, 1, MPI_INT, MPI_MAX, comm);
+    int winner = (win_id1>0) ? (win_id1-1) : -1;
 
     double t1 = MPI_Wtime();
 
-    // Rank 0 reporta
-    int winner = -1;
-    if(found != NOT_FOUND){
-        winner = (id==0 && st.MPI_SOURCE==MPI_ANY_SOURCE) ? 0 : st.MPI_SOURCE;
-        // Si yo encontré, MPI_Test pudo no setear st: fuerza winner = id si no hubo recv
-        if(winner < 0) winner = id;
-    }
-
-    // Reunir al rank 0 quién reporta
-    int local_found = (found != NOT_FOUND) ? 1 : 0;
-    int any_found = 0;
-    MPI_Allreduce(&local_found, &any_found, 1, MPI_INT, MPI_LOR, comm);
-
+    // rank 0 imprime única línea estable
     if(id==0){
-        if(!any_found){
-            printf("np=%d; key=NOT_FOUND; t_total=%.6f s\n", N, t1-t0);
-        }else{
-            // Descifrar copia para imprimir texto
-            unsigned char out[64]; // alcanza para 16 bytes
-            memset(out, 0, sizeof(out));
+        if(global_found==ULLONG_MAX){
+            printf("np=%d; key=NOT_FOUND; winner=-1; t_total=%.6f s;\n", N, t1-t0);
+        } else {
+            // descifra copia para imprimir texto (hasta 64B seguros)
+            unsigned char out[64]; memset(out,0,sizeof(out));
             int L = (ciphlen < (int)sizeof(out)) ? ciphlen : (int)sizeof(out);
             memcpy(out, cipher, L);
-            des_decrypt(found, out, L);
+            des_decrypt(global_found, out, L);
             printf("np=%d; key=%llu; winner=%d; t_total=%.6f s; text=\"%.*s\"\n",
-                   N, (unsigned long long)found, winner, t1-t0, L, out);
+                N, (unsigned long long)global_found, winner, t1-t0, L, out);
         }
         fflush(stdout);
     }
 
+    if(in_path && cipher && cipher!=cipher_embedded) free(cipher);
     MPI_Finalize();
     return 0;
 }
