@@ -330,19 +330,18 @@ int main(int argc, char **argv){
     double t1 = MPI_Wtime();
     double elapsed = t1 - t0;
 
-    // ---- salida única (compatible con tus scripts: time=...) ----
     if(id==0){
         if(global_found==ULLONG_MAX){
-            printf("np=%d key=NOT_FOUND time=%.6f git=%s\n", N, elapsed, GIT_COMMIT);
+            printf("np=%d; key=NOT_FOUND; winner=%d; t_total=%.6f; git=%s\n",
+                N, winner, elapsed, GIT_COMMIT);
         } else {
             // decodifica una copia para mostrar texto
             unsigned char out[64]; memset(out,0,sizeof(out));
             int L = (ciphlen < (int)sizeof(out)) ? ciphlen : (int)sizeof(out);
             memcpy(out, cipher, L);
             des_decrypt(global_found, out, L);
-            printf("np=%d key=%llu time=%.6f git=%s plain=\"%.*s\"\n",
-                N, (unsigned long long)global_found, elapsed, GIT_COMMIT, L, out);
-            (void)winner; // ganador calculado por consistencia; no lo imprimimos
+            printf("np=%d; key=%llu; winner=%d; t_total=%.6f; git=%s; plain=\"%.*s\"\n",
+                N, (unsigned long long)global_found, winner, elapsed, GIT_COMMIT, L, out);
         }
         fflush(stdout);
     }
