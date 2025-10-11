@@ -1,0 +1,9 @@
+cipher_early_dynamic:0.0671067000
+cipher_interleaved:0.0474639000
+cipher_block:0.0415368000
+cipher_dynamic:0.0448214000
+cipher_early_block:0.0665116000
+cipher_early_interleaved:0.0695237000
+message_secret_block:2.44053
+message_secret_interleaved:2.49657
+message_secret_dynamic:2.54194
